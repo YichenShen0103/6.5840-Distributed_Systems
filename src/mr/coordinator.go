@@ -1,6 +1,7 @@
 package mr
 
 import (
+	"errors"
 	"log"
 	"net"
 	"net/http"
@@ -10,7 +11,97 @@ import (
 	"time"
 )
 
-const maxTaskTime = 10 // seconds
+const (
+	maxTaskTime = 20
+	debug       = false
+)
+
+type node struct {
+	data any
+	prev *node
+	next *node
+}
+
+type BlockQueue struct {
+	head  *node
+	count int
+	cond  *sync.Cond
+}
+
+func NewBlockQueue() *BlockQueue {
+	h := &node{}
+	h.next = h
+	h.prev = h
+	return &BlockQueue{
+		head: h,
+		cond: sync.NewCond(&sync.Mutex{}),
+	}
+}
+
+func (q *BlockQueue) PutFront(data any) {
+	q.cond.L.Lock()
+	n := &node{data: data}
+	n.next = q.head.next
+	n.prev = q.head
+	q.head.next.prev = n
+	q.head.next = n
+	q.count++
+	q.cond.Broadcast()
+	q.cond.L.Unlock()
+}
+
+func (q *BlockQueue) PopBack() (any, error) {
+	q.cond.L.Lock()
+	defer q.cond.L.Unlock()
+	if q.count == 0 {
+		return nil, errors.New("empty queue")
+	}
+	n := q.head.prev
+	n.prev.next = q.head
+	q.head.prev = n.prev
+	q.count--
+	return n.data, nil
+}
+
+func (q *BlockQueue) Size() int {
+	q.cond.L.Lock()
+	defer q.cond.L.Unlock()
+	return q.count
+}
+
+type MapSet struct {
+	mapbool map[any]bool
+	count   int
+}
+
+func NewMapSet() *MapSet {
+	m := MapSet{}
+	m.mapbool = make(map[any]bool)
+	m.count = 0
+	return &m
+}
+
+func (m *MapSet) Insert(data any) {
+	if !m.mapbool[data] {
+		m.mapbool[data] = true
+		m.count++
+	}
+}
+
+func (m *MapSet) Has(data any) bool {
+	return m.mapbool[data]
+}
+
+func (m *MapSet) Remove(data any) {
+	if m.mapbool[data] {
+		m.mapbool[data] = false
+		m.count--
+	}
+}
+
+func (m *MapSet) Size() int {
+	return m.count
+}
 
 type MapTaskState struct {
 	beginSecond int64
@@ -29,6 +120,7 @@ type Coordinator struct {
 	fileNames []string
 	nReduce   int
 
+	stateMutex  sync.RWMutex
 	curWorkerId int
 
 	unIssuedMapTasks *BlockQueue
@@ -46,6 +138,13 @@ type Coordinator struct {
 	// states
 	mapDone bool
 	allDone bool
+}
+
+func (c *Coordinator) logPrintf(format string, vars ...any) {
+	if !debug {
+		return
+	}
+	log.Printf(format, vars...)
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -73,8 +172,8 @@ type MapTaskReply struct {
 	AllDone bool
 }
 
-func mapDoneProcess(reply *MapTaskReply) {
-	log.Println("all map tasks complete, telling workers to switch to reduce mode")
+func (c *Coordinator) mapDoneProcess(reply *MapTaskReply) {
+	c.logPrintf("all map tasks complete, telling workers to switch to reduce mode\n")
 	reply.FileId = -1
 	reply.AllDone = true
 }
@@ -82,35 +181,47 @@ func mapDoneProcess(reply *MapTaskReply) {
 func (c *Coordinator) GiveMapTask(args *MapTaskArgs, reply *MapTaskReply) error {
 	if args.WorkerId == -1 {
 		// simply allocate
+		c.stateMutex.Lock()
 		reply.WorkerId = c.curWorkerId
 		c.curWorkerId++
+		c.stateMutex.Unlock()
 	} else {
 		reply.WorkerId = args.WorkerId
 	}
-	log.Printf("worker %v asks for a map task\n", reply.WorkerId)
+	c.logPrintf("worker %v asks for a map task\n", reply.WorkerId)
 
 	c.issuedMapMutex.Lock()
 
-	if c.mapDone {
+	c.stateMutex.RLock()
+	mapDone := c.mapDone
+	c.stateMutex.RUnlock()
+	if mapDone {
 		c.issuedMapMutex.Unlock()
-		mapDoneProcess(reply)
+		c.mapDoneProcess(reply)
 		return nil
 	}
 
 	if c.unIssuedMapTasks.Size() == 0 && c.issuedMapTasks.Size() == 0 {
+		c.stateMutex.Lock()
+		alreadyDone := c.mapDone
+		if !alreadyDone {
+			c.mapDone = true
+		}
+		c.stateMutex.Unlock()
 		c.issuedMapMutex.Unlock()
-		mapDoneProcess(reply)
-		c.prepareAllReduceTasks()
-		c.mapDone = true
+		c.mapDoneProcess(reply)
+		if !alreadyDone {
+			c.prepareAllReduceTasks()
+		}
 		return nil
 	}
-	log.Printf("%v unissued map tasks %v issued map tasks at hand\n", c.unIssuedMapTasks.Size(), c.issuedMapTasks.Size())
+	c.logPrintf("%v unissued map tasks %v issued map tasks at hand\n", c.unIssuedMapTasks.Size(), c.issuedMapTasks.Size())
 	c.issuedMapMutex.Unlock() // release lock to allow unissued update
 	curTime := getNowTimeSecond()
 	ret, err := c.unIssuedMapTasks.PopBack()
 	var fileId int
 	if err != nil {
-		log.Println("no map task yet, let worker wait...")
+		c.logPrintf("no map task yet, let worker wait...\n")
 		fileId = -1
 	} else {
 		fileId = ret.(int)
@@ -120,7 +231,7 @@ func (c *Coordinator) GiveMapTask(args *MapTaskArgs, reply *MapTaskReply) error 
 		c.mapTasks[fileId].workerId = reply.WorkerId
 		c.issuedMapTasks.Insert(fileId)
 		c.issuedMapMutex.Unlock()
-		log.Printf("giving map task %v on file %v at second %v\n", fileId, reply.FileName, curTime)
+		c.logPrintf("giving map task %v on file %v at second %v\n", fileId, reply.FileName, curTime)
 	}
 
 	reply.FileId = fileId
@@ -145,7 +256,7 @@ func getNowTimeSecond() int64 {
 
 func (c *Coordinator) JoinMapTask(args *MapTaskJoinArgs, reply *MapTaskJoinReply) error {
 	// check current time for whether the worker has timed out
-	log.Printf("got join request from worker %v on file %v %v\n", args.WorkerId, args.FileId, c.fileNames[args.FileId])
+	c.logPrintf("got join request from worker %v on file %v %v\n", args.WorkerId, args.FileId, c.fileNames[args.FileId])
 
 	// log.Println("locking issuedMutex...")
 	c.issuedMapMutex.Lock()
@@ -153,24 +264,25 @@ func (c *Coordinator) JoinMapTask(args *MapTaskJoinArgs, reply *MapTaskJoinReply
 	curTime := getNowTimeSecond()
 	taskTime := c.mapTasks[args.FileId].beginSecond
 	if !c.issuedMapTasks.Has(args.FileId) {
-		log.Println("task abandoned or does not exists, ignoring...")
+		c.logPrintf("task abandoned or does not exists, ignoring...\n")
 		// log.Println("unlocking issuedMutex...")
 		c.issuedMapMutex.Unlock()
 		reply.Accept = false
 		return nil
 	}
 	if c.mapTasks[args.FileId].workerId != args.WorkerId {
-		log.Printf("map task belongs to worker %v not this %v, ignoring...", c.mapTasks[args.FileId].workerId, args.WorkerId)
+		c.logPrintf("map task belongs to worker %v not this %v, ignoring...", c.mapTasks[args.FileId].workerId, args.WorkerId)
 		c.issuedMapMutex.Unlock()
 		reply.Accept = false
 		return nil
 	}
 	if curTime-taskTime > maxTaskTime {
-		log.Println("task exceeds max wait time, abadoning...")
+		c.logPrintf("task exceeds max wait time, abadoning...\n")
 		reply.Accept = false
+		c.issuedMapTasks.Remove(args.FileId)
 		c.unIssuedMapTasks.PutFront(args.FileId)
 	} else {
-		log.Println("task within max wait time, accepting...")
+		c.logPrintf("task within max wait time, accepting...\n")
 		reply.Accept = true
 		c.issuedMapTasks.Remove(args.FileId)
 	}
@@ -193,30 +305,32 @@ type ReduceTaskReply struct {
 
 func (c *Coordinator) prepareAllReduceTasks() {
 	for i := range c.nReduce {
-		log.Printf("putting %vth reduce task into channel\n", i)
+		c.logPrintf("putting %vth reduce task into channel\n", i)
 		c.unIssuedReduceTasks.PutFront(i)
 	}
 }
 
 func (c *Coordinator) GiveReduceTask(args *ReduceTaskArgs, reply *ReduceTaskReply) error {
-	log.Printf("worker %v asking for a reduce task\n", args.WorkerId)
+	c.logPrintf("worker %v asking for a reduce task\n", args.WorkerId)
 	c.issuedReduceMutex.Lock()
 
 	if c.unIssuedReduceTasks.Size() == 0 && c.issuedReduceTasks.Size() == 0 {
-		log.Println("all reduce tasks complete, telling workers to terminate")
+		c.logPrintf("all reduce tasks complete, telling workers to terminate\n")
 		c.issuedReduceMutex.Unlock()
+		c.stateMutex.Lock()
 		c.allDone = true
+		c.stateMutex.Unlock()
 		reply.RIndex = -1
 		reply.AllDone = true
 		return nil
 	}
-	log.Printf("%v unissued reduce tasks %v issued reduce tasks at hand\n", c.unIssuedReduceTasks.Size(), c.issuedReduceTasks.Size())
+	c.logPrintf("%v unissued reduce tasks %v issued reduce tasks at hand\n", c.unIssuedReduceTasks.Size(), c.issuedReduceTasks.Size())
 	c.issuedReduceMutex.Unlock() // release lock to allow unissued update
 	curTime := getNowTimeSecond()
 	ret, err := c.unIssuedReduceTasks.PopBack()
 	var rindex int
 	if err != nil {
-		log.Println("no reduce task yet, let worker wait...")
+		c.logPrintf("no reduce task yet, let worker wait...\n")
 		rindex = -1
 	} else {
 		rindex = ret.(int)
@@ -225,7 +339,7 @@ func (c *Coordinator) GiveReduceTask(args *ReduceTaskArgs, reply *ReduceTaskRepl
 		c.reduceTasks[rindex].workerId = args.WorkerId
 		c.issuedReduceTasks.Insert(rindex)
 		c.issuedReduceMutex.Unlock()
-		log.Printf("giving reduce task %v at second %v\n", rindex, curTime)
+		c.logPrintf("giving reduce task %v at second %v\n", rindex, curTime)
 	}
 
 	reply.RIndex = rindex
@@ -247,7 +361,7 @@ type ReduceTaskJoinReply struct {
 
 func (c *Coordinator) JoinReduceTask(args *ReduceTaskJoinArgs, reply *ReduceTaskJoinReply) error {
 	// check current time for whether the worker has timed out
-	log.Printf("got join request from worker %v on reduce task %v\n", args.WorkerId, args.RIndex)
+	c.logPrintf("got join request from worker %v on reduce task %v\n", args.WorkerId, args.RIndex)
 
 	// log.Println("locking issuedMutex...")
 	c.issuedReduceMutex.Lock()
@@ -255,23 +369,24 @@ func (c *Coordinator) JoinReduceTask(args *ReduceTaskJoinArgs, reply *ReduceTask
 	curTime := getNowTimeSecond()
 	taskTime := c.reduceTasks[args.RIndex].beginSecond
 	if !c.issuedReduceTasks.Has(args.RIndex) {
-		log.Println("task abandoned or does not exists, ignoring...")
+		c.logPrintf("task abandoned or does not exists, ignoring...\n")
 		// log.Println("unlocking issuedMutex...")
 		c.issuedReduceMutex.Unlock()
 		return nil
 	}
 	if c.reduceTasks[args.RIndex].workerId != args.WorkerId {
-		log.Printf("reduce task belongs to worker %v not this %v, ignoring...", c.reduceTasks[args.RIndex].workerId, args.WorkerId)
+		c.logPrintf("reduce task belongs to worker %v not this %v, ignoring...", c.reduceTasks[args.RIndex].workerId, args.WorkerId)
 		c.issuedReduceMutex.Unlock()
 		reply.Accept = false
 		return nil
 	}
 	if curTime-taskTime > maxTaskTime {
-		log.Println("task exceeds max wait time, abadoning...")
+		c.logPrintf("task exceeds max wait time, abadoning...\n")
 		reply.Accept = false
+		c.issuedReduceTasks.Remove(args.RIndex)
 		c.unIssuedReduceTasks.PutFront(args.RIndex)
 	} else {
-		log.Println("task within max wait time, accepting...")
+		c.logPrintf("task within max wait time, accepting...\n")
 		reply.Accept = true
 		c.issuedReduceTasks.Remove(args.RIndex)
 	}
@@ -281,12 +396,12 @@ func (c *Coordinator) JoinReduceTask(args *ReduceTaskJoinArgs, reply *ReduceTask
 	return nil
 }
 
-func (m *MapSet) removeTimeoutMapTasks(mapTasks []MapTaskState, unIssuedMapTasks *BlockQueue) {
+func (m *MapSet) removeTimeoutMapTasks(c *Coordinator, mapTasks []MapTaskState, unIssuedMapTasks *BlockQueue) {
 	for fileId, issued := range m.mapbool {
 		now := getNowTimeSecond()
 		if issued {
 			if now-mapTasks[fileId.(int)].beginSecond > maxTaskTime {
-				log.Printf("worker %v on file %v abandoned due to timeout\n", mapTasks[fileId.(int)].workerId, fileId)
+				c.logPrintf("worker %v on file %v abandoned due to timeout\n", mapTasks[fileId.(int)].workerId, fileId)
 				m.mapbool[fileId.(int)] = false
 				m.count--
 				unIssuedMapTasks.PutFront(fileId.(int))
@@ -295,12 +410,12 @@ func (m *MapSet) removeTimeoutMapTasks(mapTasks []MapTaskState, unIssuedMapTasks
 	}
 }
 
-func (m *MapSet) removeTimeoutReduceTasks(reduceTasks []ReduceTaskState, unIssuedReduceTasks *BlockQueue) {
+func (m *MapSet) removeTimeoutReduceTasks(c *Coordinator, reduceTasks []ReduceTaskState, unIssuedReduceTasks *BlockQueue) {
 	for fileId, issued := range m.mapbool {
 		now := getNowTimeSecond()
 		if issued {
 			if now-reduceTasks[fileId.(int)].beginSecond > maxTaskTime {
-				log.Printf("worker %v on file %v abandoned due to timeout\n", reduceTasks[fileId.(int)].workerId, fileId)
+				c.logPrintf("worker %v on file %v abandoned due to timeout\n", reduceTasks[fileId.(int)].workerId, fileId)
 				m.mapbool[fileId.(int)] = false
 				m.count--
 				unIssuedReduceTasks.PutFront(fileId.(int))
@@ -310,12 +425,12 @@ func (m *MapSet) removeTimeoutReduceTasks(reduceTasks []ReduceTaskState, unIssue
 }
 
 func (c *Coordinator) removeTimeoutTasks() {
-	log.Println("removing timeout maptasks...")
+	c.logPrintf("removing timeout maptasks...\n")
 	c.issuedMapMutex.Lock()
-	c.issuedMapTasks.removeTimeoutMapTasks(c.mapTasks, c.unIssuedMapTasks)
+	c.issuedMapTasks.removeTimeoutMapTasks(c, c.mapTasks, c.unIssuedMapTasks)
 	c.issuedMapMutex.Unlock()
 	c.issuedReduceMutex.Lock()
-	c.issuedReduceTasks.removeTimeoutReduceTasks(c.reduceTasks, c.unIssuedReduceTasks)
+	c.issuedReduceTasks.removeTimeoutReduceTasks(c, c.reduceTasks, c.unIssuedReduceTasks)
 	c.issuedReduceMutex.Unlock()
 }
 
@@ -362,13 +477,17 @@ func (c *Coordinator) Done() bool {
 
 	// return ret
 
-	if c.allDone {
-		log.Println("asked whether i am done, replying yes...")
+	c.stateMutex.RLock()
+	allDone := c.allDone
+	c.stateMutex.RUnlock()
+
+	if allDone {
+		c.logPrintf("asked whether i am done, replying yes...\n")
 	} else {
-		log.Println("asked whether i am done, replying no...")
+		c.logPrintf("asked whether i am done, replying no...\n")
 	}
 
-	return c.allDone
+	return allDone
 }
 
 // create a Coordinator.
@@ -380,7 +499,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	// Your code here.
 
 	log.SetPrefix("coordinator: ")
-	log.Println("making coordinator")
+	c.logPrintf("making coordinator\n")
 
 	c.fileNames = files
 	c.nReduce = nReduce
@@ -396,15 +515,15 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 
 	// start a thread that listens for RPCs from worker.go
 	c.server()
-	log.Println("listening started...")
+	c.logPrintf("listening started...\n")
 	// starts a thread that abandons timeout tasks
 	go c.loopRemoveTimeoutMapTasks()
 
 	// all are unissued map tasks
 	// send to channel after everything else initializes
-	log.Printf("file count %d\n", len(files))
+	c.logPrintf("file count %d\n", len(files))
 	for i := range len(files) {
-		log.Printf("sending %vth file map task to channel\n", i)
+		c.logPrintf("sending %vth file map task to channel\n", i)
 		c.unIssuedMapTasks.PutFront(i)
 	}
 

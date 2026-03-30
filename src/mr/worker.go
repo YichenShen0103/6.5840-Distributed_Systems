@@ -9,6 +9,7 @@ import (
 	"net/rpc"
 	"os"
 	"sort"
+	"time"
 )
 
 // Map functions return a slice of KeyValue.
@@ -98,7 +99,10 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 }
 
 func (worker *AWorker) logPrintf(format string, vars ...any) {
-	log.Printf("worker %d: "+format, worker.workerId, vars)
+	if !debug {
+		return
+	}
+	log.Printf("worker %d: "+format, append([]any{worker.workerId}, vars...)...)
 }
 
 func (worker *AWorker) askMapTask() *MapTaskReply {
@@ -333,6 +337,7 @@ func (worker *AWorker) process() {
 		} else {
 			if reply.FileId == -1 {
 				// no available tasks for now
+				time.Sleep(200 * time.Millisecond)
 			} else {
 				// must execute
 				worker.executeMap(reply)
@@ -349,6 +354,7 @@ func (worker *AWorker) process() {
 		} else {
 			if reply.RIndex == -1 {
 				// noavailable tasks for now
+				time.Sleep(200 * time.Millisecond)
 			} else {
 				// must execute
 				worker.executeReduce(reply)
